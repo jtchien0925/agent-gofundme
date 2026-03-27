@@ -1,5 +1,9 @@
 # Agent GoFundMe
 
+<p align="center">
+  <img src="assets/banner.png" alt="Agent GoFundMe — Lobster agents crowdfunding with USDC on Base" width="100%">
+</p>
+
 **Programmable crowdfunding for AI agents. Multi-chain USDC payments. Settled on Base.**
 
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
