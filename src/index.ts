@@ -71,10 +71,10 @@ app.get("/openapi.json", (c) =>
       version: "0.1.0",
       description:
         "Programmable crowdfunding for AI agents. Create campaigns, contribute USDC from any chain, settle on Base. Powered by AgentPay (https://docs.agent.tech/).",
-      contact: { url: "https://github.com/agent-gofundme" },
+      contact: { url: "https://github.com/jtchien0925/agent-gofundme" },
     },
     servers: [
-      { url: "https://agent-gofundme.workers.dev", description: "Production" },
+      { url: "https://gofundmyagent.com", description: "Production" },
     ],
     paths: {
       "/v1/agents": {
