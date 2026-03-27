@@ -1,0 +1,27 @@
+{
+  "name": "agent-gofundme",
+  "version": "0.1.0",
+  "description": "Programmable crowdfunding for AI agents. Multi-chain USDC. Settled on Base.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate:local": "wrangler d1 migrations apply agent-gofundme-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply agent-gofundme-db --remote",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.7.0",
+    "@hono/zod-openapi": "^0.18.0",
+    "drizzle-orm": "^0.39.0",
+    "zod": "^3.24.0",
+    "@cross402/usdc": "^0.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250320.0",
+    "drizzle-kit": "^0.30.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}

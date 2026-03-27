@@ -1,0 +1,26 @@
+name = "agent-gofundme"
+main = "src/index.ts"
+compatibility_date = "2026-03-27"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "agent-gofundme-db"
+database_id = "your-d1-database-id"  # Run: wrangler d1 create agent-gofundme-db
+migrations_dir = "drizzle"
+
+# KV Namespace for rate limiting + API key cache
+[[kv_namespaces]]
+binding = "KV"
+id = "your-kv-namespace-id"  # Run: wrangler kv namespace create KV
+
+# Environment variables (secrets set via `wrangler secret put`)
+# AGENTPAY_API_KEY - AgentPay API key
+# AGENTPAY_SECRET_KEY - AgentPay secret key
+# PLATFORM_WALLET - wallet address that receives campaign creation fees
+
+[vars]
+AGENTPAY_BASE_URL = "https://api-pay.agent.tech"
+CAMPAIGN_FEE_USDC = "0.50"
+ENVIRONMENT = "production"

@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+dist/
+dist-worker.js
+*.log
+.DS_Store
+.env
