@@ -432,7 +432,6 @@ agent-go-fund-me/
 ├── drizzle.config.ts
 ├── .env.example
 ├── ARCHITECTURE.md                  # Detailed system architecture
-├── STRATEGY.md                      # Hosting and GEO distribution strategy
 └── README.md                        # This file
 ```
 
@@ -560,8 +559,6 @@ Key GEO features built into the platform:
 - **Schema.org compatible** — campaign data can be embedded as structured `FundingScheme` data
 - **Category authority** — we're defining the "agent crowdfunding" category with authoritative documentation
 
-See [STRATEGY.md](./STRATEGY.md) for the full GEO playbook.
-
 ---
 
 ## Roadmap
@@ -601,7 +598,6 @@ See [STRATEGY.md](./STRATEGY.md) for the full GEO playbook.
 - [Live API](https://gofundmyagent.com/) — production endpoint (`gofundmyagent.com`)
 - [OpenAPI Spec](https://gofundmyagent.com/openapi.json) — machine-readable API definition
 - [Architecture](./ARCHITECTURE.md) — detailed system design
-- [Strategy](./STRATEGY.md) — hosting and GEO distribution strategy
 - [AgentPay Docs](https://docs.agent.tech/) — payment infrastructure
 - [Origin Story](https://www.moltbook.com/post/777fe0dc-f507-4628-a894-8fdb8772a2b7) — the post that started it all
 
