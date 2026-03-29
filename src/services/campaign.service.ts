@@ -1,16 +1,22 @@
 /**
- * Campaign Service — create, update, activate, close campaigns
+ * Campaign Service — create, update, activate, close campaigns.
  *
- * Fee flow (v2 — direct on-chain):
- *   The platform charges a flat 0.50 USDC activation fee. Instead of an
- *   AgentPay intent (which only the creating account can execute), creators
- *   send USDC directly to the platform wallet on Base chain and submit the
- *   tx hash. The platform verifies the transfer on-chain via Base RPC.
+ * Fee flow (v3 — public API + on-chain):
+ *   The platform charges a flat 0.50 USDC activation fee. Creators can pay
+ *   two ways:
  *
- * Contributions still use AgentPay intents (creator ≠ payer, so that works).
+ *   1. Via AgentPay: POST /activate with { payer_chain } → platform creates
+ *      a public intent (no auth), returns paymentRequirements. Creator pays
+ *      with their own wallet, then calls POST /activate again with the
+ *      intent_id or settle_proof.
+ *
+ *   2. Direct USDC transfer: Send USDC to platform wallet on Base, then
+ *      call POST /activate with { tx_hash }.
+ *
+ *   The platform NEVER uses its own credentials to create or execute intents.
  */
 
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, desc, sql } from "drizzle-orm";
 import type { Database } from "../db";
 import { schema } from "../db";
 import { generateId } from "./crypto";
@@ -40,8 +46,9 @@ export class CampaignService {
 
   /**
    * Create a campaign (status: DRAFT).
-   * Returns payment instructions — the creator must send 0.50 USDC to the
-   * platform wallet on Base, then call POST /activate with the tx hash.
+   * Returns fee payment instructions — two options:
+   *   1. Direct transfer: send USDC to platform wallet on Base
+   *   2. AgentPay: call POST /activate with { payer_chain } to get an intent
    */
   async create(
     agentId: string,
@@ -62,7 +69,13 @@ export class CampaignService {
       agentId,
       title: params.title,
       description: params.description,
-      category: params.category as "compute" | "api_credits" | "infrastructure" | "research" | "community" | "other",
+      category: params.category as
+        | "compute"
+        | "api_credits"
+        | "infrastructure"
+        | "research"
+        | "community"
+        | "other",
       campaignType: params.campaignType as "self_fund" | "project_fund",
       goalAmount: parseFloat(params.goalAmount),
       raisedAmount: 0,
@@ -81,29 +94,54 @@ export class CampaignService {
       fee: {
         amount: this.campaignFee,
         currency: "USDC",
-        chain: "base",
-        recipient: this.platformWallet,
-        token_contract: USDC_BASE,
-        message: `Send ${this.campaignFee} USDC to ${this.platformWallet} on Base chain, then call POST /v1/campaigns/${id}/activate with { "tx_hash": "<your_tx_hash>" }.`,
+        instructions: {
+          option_a: {
+            method: "agentpay",
+            description:
+              "Call POST /v1/campaigns/" +
+              id +
+              '/activate with { "payer_chain": "base" } to get paymentRequirements. ' +
+              "Pay with your wallet, then call /activate again with the intent_id.",
+          },
+          option_b: {
+            method: "direct_transfer",
+            chain: "base",
+            recipient: this.platformWallet,
+            token_contract: USDC_BASE,
+            description:
+              `Send ${this.campaignFee} USDC to ${this.platformWallet} on Base, ` +
+              `then call POST /v1/campaigns/${id}/activate with { "tx_hash": "0x..." }.`,
+          },
+        },
       },
     };
   }
 
   /**
-   * Activate a campaign — requires a Base chain tx hash proving the creator
-   * sent the activation fee (0.50 USDC) to the platform wallet.
+   * Activate a campaign — verify fee payment.
    *
-   * The tx hash is verified on-chain via Base RPC (eth_getTransactionReceipt).
-   * If the tx contains a USDC Transfer event to the platform wallet for ≥ fee
-   * amount, the campaign is activated.
-   *
-   * If no tx_hash is provided, returns payment instructions (402).
+   * Three modes:
+   *   1. { payer_chain } → create AgentPay intent, return paymentRequirements
+   *   2. { tx_hash: "0x..." } → verify on-chain USDC transfer
+   *   3. { intent_id | settle_proof } → verify via AgentPay
+   *   4. No body → return payment instructions (402)
    */
-  async activate(campaignId: string, agentId: string, txHash?: string) {
+  async activate(
+    campaignId: string,
+    agentId: string,
+    opts?: {
+      txHash?: string;
+      settleProof?: string;
+      intentId?: string;
+      payerChain?: string;
+    }
+  ) {
     const campaign = await this.getById(campaignId);
     if (!campaign) throw new CampaignError("Campaign not found", 404);
-    if (campaign.agentId !== agentId) throw new CampaignError("Not your campaign", 403);
-    if (campaign.status !== "draft") throw new CampaignError("Campaign is not in draft status", 400);
+    if (campaign.agentId !== agentId)
+      throw new CampaignError("Not your campaign", 403);
+    if (campaign.status !== "draft")
+      throw new CampaignError("Campaign is not in draft status", 400);
 
     // If already paid (e.g. via old intent flow), just activate
     if (campaign.feePaid) {
@@ -111,11 +149,47 @@ export class CampaignService {
         .update(schema.campaigns)
         .set({ status: "active", updatedAt: new Date().toISOString() })
         .where(eq(schema.campaigns.id, campaignId));
-      return { status: "activated" as const, campaign: await this.getById(campaignId) };
+      return {
+        status: "activated" as const,
+        campaign: await this.getById(campaignId),
+      };
     }
 
-    // No tx hash provided — return payment instructions
-    if (!txHash) {
+    // Mode 1: payer_chain provided → create intent, return paymentRequirements
+    if (opts?.payerChain && !opts.txHash && !opts.settleProof && !opts.intentId) {
+      const intent = await this.payment.createIntent({
+        recipient: this.platformWallet,
+        amount: this.campaignFee,
+        payerChain: opts.payerChain,
+      });
+
+      // Store the intent ID for later verification
+      await this.db
+        .update(schema.campaigns)
+        .set({
+          feeIntentId: intent.intentId,
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(schema.campaigns.id, campaignId));
+
+      return {
+        status: "awaiting_payment" as const,
+        intent: {
+          intentId: intent.intentId,
+          expiresAt: intent.expiresAt,
+          paymentRequirements: intent.paymentRequirements,
+          feeBreakdown: intent.feeBreakdown,
+          recipient: this.platformWallet,
+          amount: this.campaignFee,
+        },
+      };
+    }
+
+    // Mode 2-3: verify payment proof
+    const proofValue = opts?.txHash || opts?.settleProof || opts?.intentId;
+
+    if (!proofValue) {
+      // No proof provided → return payment instructions
       return {
         status: "pending_payment" as const,
         fee: {
@@ -125,41 +199,55 @@ export class CampaignService {
           recipient: this.platformWallet,
           token_contract: USDC_BASE,
           instructions: [
-            `Send ${this.campaignFee} USDC to ${this.platformWallet} on Base chain.`,
-            `Then call POST /v1/campaigns/${campaignId}/activate with { "tx_hash": "<your_tx_hash>" }.`,
+            `Option A: Call POST /v1/campaigns/${campaignId}/activate with { "payer_chain": "base" } to get an AgentPay intent with paymentRequirements.`,
+            `Option B: Send ${this.campaignFee} USDC to ${this.platformWallet} on Base, then call /activate again with { "tx_hash": "0x..." }.`,
           ],
         },
       };
     }
 
-    // Detect: intent_id (UUID) vs tx_hash (0x hex)
-    const isIntentId = !txHash.startsWith("0x");
+    // Detect proof type and verify
     let verified = false;
     let verificationDetails = "";
+    let auditTxHash = proofValue;
 
-    if (isIntentId) {
-      // Verify via AgentPay API — check intent settled and paid platform
+    if (opts?.settleProof && campaign.feeIntentId) {
+      // Submit settle proof to AgentPay for the stored intent
+      try {
+        const result = await this.payment.submitProof(
+          campaign.feeIntentId,
+          opts.settleProof
+        );
+        if (result.status === "BASE_SETTLED") {
+          verified = true;
+          if (result.baseTxHash) auditTxHash = result.baseTxHash;
+        } else {
+          verificationDetails = `Proof submitted but status is "${result.status}". Payment may still be processing.`;
+        }
+      } catch (err) {
+        verificationDetails = `Failed to submit proof: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    } else if (proofValue.startsWith("0x")) {
+      // Raw tx_hash → verify on-chain
+      verified = await this.verifyFeeTx(proofValue);
+      if (!verified) {
+        verificationDetails =
+          `Transaction ${proofValue} could not be verified as a valid fee payment. ` +
+          `Expected: ≥${this.campaignFee} USDC transfer to ${this.platformWallet} on Base.`;
+      }
+    } else {
+      // UUID-like → intent_id, verify via AgentPay
       const result = await this.payment.verifyIntentSettled(
-        txHash,
+        proofValue,
         this.platformWallet,
         this.campaignFee
       );
       verified = result.verified;
       if (!verified) {
-        verificationDetails = result.details || "Intent verification failed";
-      }
-      // If intent verified and has a base tx hash, store that for audit trail
-      if (result.txHash) {
-        txHash = result.txHash; // Use the actual on-chain tx hash for storage
-      }
-    } else {
-      // Verify directly on-chain via Base RPC
-      verified = await this.verifyFeeTx(txHash);
-      if (!verified) {
         verificationDetails =
-          `Transaction ${txHash} could not be verified as a valid fee payment. ` +
-          `Expected: ≥${this.campaignFee} USDC transfer to ${this.platformWallet} on Base.`;
+          result.details || "Intent verification failed";
       }
+      if (result.txHash) auditTxHash = result.txHash;
     }
 
     if (!verified) {
@@ -172,7 +260,7 @@ export class CampaignService {
       .set({
         status: "active",
         feePaid: true,
-        feeIntentId: txHash, // store tx hash for audit trail
+        feeIntentId: auditTxHash,
         updatedAt: new Date().toISOString(),
       })
       .where(eq(schema.campaigns.id, campaignId));
@@ -213,13 +301,17 @@ export class CampaignService {
       };
 
       if (!data.result || data.result.status !== "0x1") {
-        return false; // tx failed or not found
+        return false;
       }
 
-      // ERC-20 Transfer event topic: Transfer(address,address,uint256)
-      const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-      const platformPadded = "0x" + this.platformWallet.slice(2).toLowerCase().padStart(64, "0");
-      const feeInWei = BigInt(Math.round(parseFloat(this.campaignFee) * 1e6)); // USDC has 6 decimals
+      const TRANSFER_TOPIC =
+        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+      const platformPadded =
+        "0x" +
+        this.platformWallet.slice(2).toLowerCase().padStart(64, "0");
+      const feeInWei = BigInt(
+        Math.round(parseFloat(this.campaignFee) * 1e6)
+      );
 
       for (const log of data.result.logs) {
         if (
@@ -234,17 +326,56 @@ export class CampaignService {
 
       return false;
     } catch {
-      // RPC error — don't block activation, log and allow retry
-      throw new CampaignError("Failed to verify transaction on Base chain. Please try again.", 503);
+      throw new CampaignError(
+        "Failed to verify transaction on Base chain. Please try again.",
+        503
+      );
     }
   }
 
   /**
-   * Legacy pay-fee endpoint — accepts a tx hash and verifies on-chain.
-   * Kept for backward compatibility with agents that use /pay-fee instead of /activate.
+   * Legacy pay-fee endpoint — redirects to activate.
    */
-  async payFee(campaignId: string, agentId: string, txHash: string) {
-    return this.activate(campaignId, agentId, txHash);
+  async payFee(
+    campaignId: string,
+    agentId: string,
+    txHash: string
+  ) {
+    return this.activate(campaignId, agentId, { txHash });
+  }
+
+  /** List active campaigns (public, paginated) */
+  async listActive(limit = 20, offset = 0) {
+    const conditions = [
+      eq(schema.campaigns.status, "active"),
+      eq(schema.campaigns.feePaid, true),
+    ];
+
+    const campaigns = await this.db
+      .select()
+      .from(schema.campaigns)
+      .where(and(...conditions))
+      .orderBy(desc(schema.campaigns.createdAt))
+      .limit(limit)
+      .offset(offset);
+
+    const countResult = await this.db
+      .select({ count: sql<number>`count(*)` })
+      .from(schema.campaigns)
+      .where(and(...conditions));
+
+    const total = countResult[0]?.count || 0;
+
+    return {
+      campaigns: campaigns.map((c) => ({
+        ...c,
+        progress:
+          c.goalAmount > 0
+            ? Math.round((c.raisedAmount / c.goalAmount) * 100 * 10) / 10
+            : 0,
+      })),
+      pagination: { total, limit, offset, hasMore: offset + limit < total },
+    };
   }
 
   /** Get campaign by ID */
@@ -266,9 +397,13 @@ export class CampaignService {
   ) {
     const campaign = await this.getById(id);
     if (!campaign) throw new CampaignError("Campaign not found", 404);
-    if (campaign.agentId !== agentId) throw new CampaignError("Not your campaign", 403);
+    if (campaign.agentId !== agentId)
+      throw new CampaignError("Not your campaign", 403);
     if (campaign.status === "closed" || campaign.status === "expired") {
-      throw new CampaignError("Cannot update a closed or expired campaign", 400);
+      throw new CampaignError(
+        "Cannot update a closed or expired campaign",
+        400
+      );
     }
 
     const updates: Record<string, unknown> = {
@@ -290,9 +425,13 @@ export class CampaignService {
   async close(id: string, agentId: string) {
     const campaign = await this.getById(id);
     if (!campaign) throw new CampaignError("Campaign not found", 404);
-    if (campaign.agentId !== agentId) throw new CampaignError("Not your campaign", 403);
+    if (campaign.agentId !== agentId)
+      throw new CampaignError("Not your campaign", 403);
     if (campaign.status === "closed" || campaign.status === "expired") {
-      throw new CampaignError("Campaign is already closed or expired", 400);
+      throw new CampaignError(
+        "Campaign is already closed or expired",
+        400
+      );
     }
 
     await this.db

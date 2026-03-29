@@ -7,13 +7,13 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "agent-gofundme-db"
-database_id = "your-d1-database-id"  # Run: wrangler d1 create agent-gofundme-db
+database_id = "b480fcb7-6b80-4f7e-a5be-e780231a6964"
 migrations_dir = "drizzle"
 
 # KV Namespace for rate limiting + API key cache
 [[kv_namespaces]]
 binding = "KV"
-id = "your-kv-namespace-id"  # Run: wrangler kv namespace create KV
+id = "8f130c05906049348ed002e9ade70659"
 
 # Environment variables (secrets set via `wrangler secret put`)
 # AGENTPAY_API_KEY - AgentPay API key

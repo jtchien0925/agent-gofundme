@@ -4,8 +4,11 @@ export function getConfig(env: Env) {
   return {
     agentPay: {
       baseUrl: env.AGENTPAY_BASE_URL || "https://api-pay.agent.tech",
-      apiKey: env.AGENTPAY_API_KEY,
-      secretKey: env.AGENTPAY_SECRET_KEY,
+      // API key and secret are no longer required — the platform uses
+      // the public API (/api/intents) which needs no authentication.
+      // Kept here for potential future use (e.g. analytics, webhooks).
+      apiKey: env.AGENTPAY_API_KEY || "",
+      secretKey: env.AGENTPAY_SECRET_KEY || "",
     },
     platform: {
       wallet: env.PLATFORM_WALLET,

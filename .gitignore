@@ -6,3 +6,12 @@ dist-worker.js
 *.log
 .DS_Store
 .env
+
+# Deployment artifacts
+deploy_console.js
+
+# Images (use GitHub releases or CDN for large assets)
+*.png
+
+# Python virtual environments
+mcp-server/.venv/

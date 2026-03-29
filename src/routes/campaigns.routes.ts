@@ -1,6 +1,10 @@
 /**
  * Campaign routes — create, update, activate, close, list contributions
- * Campaign fees paid via AgentPay (https://docs.agent.tech/)
+ *
+ * Fee payment flow (v3 — public API):
+ *   POST /activate with { payer_chain } → get paymentRequirements
+ *   Creator pays with own wallet
+ *   POST /activate with { intent_id | tx_hash | settle_proof } → verify & activate
  */
 
 import { Hono } from "hono";
@@ -10,26 +14,37 @@ import { CampaignService } from "../services/campaign.service";
 import { ContributionService } from "../services/contribution.service";
 import { requireAuth } from "../middleware/auth";
 import { z } from "zod";
-import { CreateCampaignSchema, UpdateCampaignSchema } from "../types/api";
+import { CreateCampaignSchema, UpdateCampaignSchema, SUPPORTED_CHAINS } from "../types/api";
 
-/** Accept tx_hash, settle_proof, or intent_id for backward compatibility */
+/**
+ * Activate schema — flexible input:
+ *   { payer_chain } → create intent, get paymentRequirements
+ *   { tx_hash }     → verify on-chain USDC transfer
+ *   { intent_id }   → verify settled AgentPay intent
+ *   { settle_proof } → submit proof for stored intent
+ */
 const ActivateCampaignSchema = z.object({
   tx_hash: z.string().optional(),
   settle_proof: z.string().optional(),
   intent_id: z.string().optional(),
+  payer_chain: z.string().optional(),
 });
 
 const PayFeeSchema = z.object({
   tx_hash: z.string().optional(),
   settle_proof: z.string().optional(),
   intent_id: z.string().optional(),
+  payer_chain: z.string().optional(),
 });
 
-type HonoEnv = { Bindings: Env; Variables: { agent: Record<string, unknown>; agentId: string } };
+type HonoEnv = {
+  Bindings: Env;
+  Variables: { agent: Record<string, unknown>; agentId: string };
+};
 
 const campaigns = new Hono<HonoEnv>();
 
-/** POST /v1/campaigns — Create a new campaign (DRAFT status, triggers fee intent) */
+/** POST /v1/campaigns — Create a new campaign (DRAFT status) */
 campaigns.post("/", requireAuth(), async (c) => {
   const body = await c.req.json();
   const params = CreateCampaignSchema.parse(body);
@@ -51,6 +66,20 @@ campaigns.post("/", requireAuth(), async (c) => {
   return c.json({ ok: true, data: result }, 201);
 });
 
+/** GET /v1/campaigns — List campaigns (redirects to discover) */
+campaigns.get("/", async (c) => {
+  const db = createDb(c.env.DB);
+  const service = new CampaignService(db, c.env);
+
+  // Return active campaigns — same as /v1/discover but unfiltered
+  const campaigns_list = await service.listActive(
+    parseInt(c.req.query("limit") || "20"),
+    parseInt(c.req.query("offset") || "0")
+  );
+
+  return c.json({ ok: true, data: campaigns_list });
+});
+
 /** GET /v1/campaigns/:id — Get campaign details (public) */
 campaigns.get("/:id", async (c) => {
   const id = c.req.param("id")!;
@@ -68,7 +97,9 @@ campaigns.get("/:id", async (c) => {
       ...campaign,
       progress:
         campaign.goalAmount > 0
-          ? Math.round((campaign.raisedAmount / campaign.goalAmount) * 100 * 10) / 10
+          ? Math.round(
+              (campaign.raisedAmount / campaign.goalAmount) * 100 * 10
+            ) / 10
           : 0,
     },
   });
@@ -94,23 +125,41 @@ campaigns.patch("/:id", requireAuth(), async (c) => {
 });
 
 /**
- * POST /v1/campaigns/:id/activate — Activate campaign after paying the fee.
+ * POST /v1/campaigns/:id/activate — Activate a campaign.
  *
- * Two modes:
- *   1. No body / empty body → returns 402 with payment instructions (wallet address, amount).
- *   2. Body: { tx_hash: "0x..." } → verifies the Base chain tx, activates if valid.
+ * Step 1 (get intent):
+ *   Body: { payer_chain: "base" }
+ *   → Returns AgentPay intent with paymentRequirements
+ *   → Creator pays with their own wallet
  *
- * The tx must be a USDC transfer to the platform wallet for ≥ 0.50 USDC on Base.
+ * Step 2 (verify & activate):
+ *   Body: { intent_id: "uuid" } or { tx_hash: "0x..." } or { settle_proof: "..." }
+ *   → Platform verifies payment, activates campaign
+ *
+ * If no body → returns 402 with payment instructions.
  */
 campaigns.post("/:id/activate", requireAuth(), async (c) => {
   const id = c.req.param("id")!;
   const agentId = c.get("agentId") as string;
 
-  let txHash: string | undefined;
+  let opts:
+    | {
+        txHash?: string;
+        settleProof?: string;
+        intentId?: string;
+        payerChain?: string;
+      }
+    | undefined;
+
   try {
     const body = await c.req.json().catch(() => ({}));
     const parsed = ActivateCampaignSchema.parse(body);
-    txHash = parsed.tx_hash || parsed.settle_proof || parsed.intent_id;
+    opts = {
+      txHash: parsed.tx_hash,
+      settleProof: parsed.settle_proof,
+      intentId: parsed.intent_id,
+      payerChain: parsed.payer_chain,
+    };
   } catch {
     // body is optional
   }
@@ -118,7 +167,7 @@ campaigns.post("/:id/activate", requireAuth(), async (c) => {
   const db = createDb(c.env.DB);
   const service = new CampaignService(db, c.env);
 
-  const result = await service.activate(id, agentId, txHash);
+  const result = await service.activate(id, agentId, opts);
 
   if (result.status === "activated") {
     return c.json({
@@ -128,11 +177,24 @@ campaigns.post("/:id/activate", requireAuth(), async (c) => {
     });
   }
 
-  // Fee not yet paid — 402 Payment Required with instructions
+  if (result.status === "awaiting_payment") {
+    return c.json(
+      {
+        ok: true,
+        data: result.intent,
+        message:
+          "Payment intent created. Use the paymentRequirements to pay with your wallet, " +
+          "then call /activate again with the intent_id or settle_proof.",
+      },
+      402
+    );
+  }
+
+  // pending_payment — return fee instructions
   return c.json(
     {
       ok: false,
-      error: `Fee not yet paid. Send ${result.fee?.amount} USDC to ${result.fee?.recipient} on Base chain, then call /activate again with { "tx_hash": "<your_tx_hash>" }.`,
+      error: `Fee not yet paid.`,
       data: result.fee,
     },
     402
@@ -140,10 +202,8 @@ campaigns.post("/:id/activate", requireAuth(), async (c) => {
 });
 
 /**
- * POST /v1/campaigns/:id/pay-fee — Submit on-chain tx hash as fee payment proof.
- *
- * Accepts { tx_hash: "0x..." } — a Base chain tx hash for a USDC transfer
- * to the platform wallet. Verifies on-chain, activates if valid.
+ * POST /v1/campaigns/:id/pay-fee — Submit fee payment proof.
+ * Alias for /activate — kept for backward compatibility.
  */
 campaigns.post("/:id/pay-fee", requireAuth(), async (c) => {
   const id = c.req.param("id")!;
@@ -151,22 +211,49 @@ campaigns.post("/:id/pay-fee", requireAuth(), async (c) => {
 
   const body = await c.req.json();
   const parsed = PayFeeSchema.parse(body);
-  const txHash = parsed.tx_hash || parsed.settle_proof || parsed.intent_id;
-  if (!txHash) {
-    return c.json({ ok: false, error: "tx_hash is required" }, 400);
+
+  const txHash = parsed.tx_hash || parsed.intent_id;
+  const settleProof = parsed.settle_proof;
+  const payerChain = parsed.payer_chain;
+
+  if (!txHash && !settleProof && !payerChain) {
+    return c.json(
+      {
+        ok: false,
+        error:
+          "Provide tx_hash, intent_id, settle_proof, or payer_chain",
+      },
+      400
+    );
   }
 
   const db = createDb(c.env.DB);
   const service = new CampaignService(db, c.env);
 
-  const result = await service.payFee(id, agentId, txHash);
+  const result = await service.activate(id, agentId, {
+    txHash,
+    settleProof,
+    payerChain,
+  });
 
   if (result.status === "activated") {
     return c.json({
       ok: true,
       data: result.campaign,
-      message: "Fee verified on-chain. Campaign is now active and accepting contributions.",
+      message:
+        "Fee verified. Campaign is now active and accepting contributions.",
     });
+  }
+
+  if (result.status === "awaiting_payment") {
+    return c.json(
+      {
+        ok: true,
+        data: result.intent,
+        message: "Payment intent created. Pay and submit proof.",
+      },
+      402
+    );
   }
 
   return c.json({ ok: false, error: "Fee verification failed" }, 402);
@@ -194,7 +281,11 @@ campaigns.get("/:id/contributions", async (c) => {
   const db = createDb(c.env.DB);
   const contributionService = new ContributionService(db, c.env);
 
-  const contributions = await contributionService.getByCampaignId(id, limit, offset);
+  const contributions = await contributionService.getByCampaignId(
+    id,
+    limit,
+    offset
+  );
 
   return c.json({ ok: true, data: contributions });
 });

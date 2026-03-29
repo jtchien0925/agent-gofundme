@@ -70,9 +70,16 @@ export const CreateContributionSchema = z.object({
     .refine((v) => parseFloat(v) >= 0.02, "Minimum contribution is 0.02 USDC")
     .refine((v) => parseFloat(v) <= 1_000_000, "Maximum is 1,000,000 USDC"),
   payer_chain: z.enum(SUPPORTED_CHAINS),
-  flow_type: z.enum(["server", "client"]).default("server"),
 });
 
+/** Settle a contribution — settle_proof (X402), tx_hash (on-chain), or intent_id */
+export const SettleContributionSchema = z.object({
+  settle_proof: z.string().min(1).optional(),
+  tx_hash: z.string().min(1).optional(),
+  intent_id: z.string().min(1).optional(),
+});
+
+/** Legacy proof schema — kept for backward compatibility */
 export const SubmitProofSchema = z.object({
   settle_proof: z.string().min(1),
 });

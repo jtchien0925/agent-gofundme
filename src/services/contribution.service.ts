@@ -1,15 +1,31 @@
 /**
- * Contribution Service — create, execute, and track campaign contributions
- * Uses AgentPay intents for multi-chain USDC payments (https://docs.agent.tech/)
+ * Contribution Service — create and track campaign contributions.
+ *
+ * Payment flow (v3 — public API):
+ *   The platform creates a payment intent via AgentPay's public API
+ *   (/api/intents) with the campaign creator's wallet as recipient.
+ *   The donor receives paymentRequirements (X402 signing details) and
+ *   pays using their own wallet. After payment, the donor either:
+ *     - Submits a settle_proof (X402/AgentPay flow)
+ *     - Submits a raw tx_hash (direct on-chain transfer)
+ *   The platform verifies settlement and records the contribution.
+ *
+ * The platform NEVER executes payments on behalf of donors.
  */
 
-import { eq, and, desc } from "drizzle-orm";
+import { eq, desc } from "drizzle-orm";
 import type { Database } from "../db";
 import { schema } from "../db";
 import { generateId } from "./crypto";
 import { PaymentService } from "./payment.service";
+import type { PaymentRequirements } from "./payment.service";
 import { CampaignService } from "./campaign.service";
 import type { Env } from "../types";
+
+/** Base mainnet RPC for verifying direct USDC transfers */
+const BASE_RPC = "https://mainnet.base.org";
+/** USDC contract on Base */
+const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
 export class ContributionService {
   private payment: PaymentService;
@@ -24,16 +40,17 @@ export class ContributionService {
   }
 
   /**
-   * Start a contribution by creating an AgentPay intent.
-   * The intent sends USDC directly to the campaign creator's wallet.
-   * https://docs.agent.tech/api/intents/#createintent
+   * Start a contribution by creating a public AgentPay intent.
+   *
+   * The intent is created with the campaign creator's wallet as recipient.
+   * Returns paymentRequirements so the donor can sign and pay with their
+   * own wallet. No platform credentials are involved.
    */
   async create(params: {
     campaignId: string;
     agentId?: string;
     amount: string;
     payerChain: string;
-    flowType: "server" | "client";
   }) {
     // Validate campaign exists and is active
     const campaign = await this.campaignService.getById(params.campaignId);
@@ -54,9 +71,10 @@ export class ContributionService {
     const creator = await this.db.query.agents.findFirst({
       where: eq(schema.agents.id, campaign.agentId),
     });
-    if (!creator) throw new ContributionError("Campaign creator not found", 500);
+    if (!creator)
+      throw new ContributionError("Campaign creator not found", 500);
 
-    // Create AgentPay intent — sends USDC to campaign creator's wallet
+    // Create AgentPay intent via public API — sends USDC to creator's wallet
     const intent = await this.payment.createIntent({
       recipient: creator.walletAddress,
       amount: params.amount,
@@ -72,7 +90,7 @@ export class ContributionService {
       payerChain: params.payerChain,
       intentId: intent.intentId,
       intentStatus: "AWAITING_PAYMENT",
-      flowType: params.flowType,
+      flowType: "client", // all flows are now payer-signed
     });
 
     return {
@@ -80,47 +98,114 @@ export class ContributionService {
       intent: {
         intentId: intent.intentId,
         expiresAt: intent.expiresAt,
+        paymentRequirements: intent.paymentRequirements,
         feeBreakdown: intent.feeBreakdown,
+        recipient: creator.walletAddress,
+        amount: params.amount,
       },
     };
   }
 
   /**
-   * Execute a contribution server-side (agent wallet signs).
-   * https://docs.agent.tech/api/intents/#executeintent
+   * Settle a contribution — the donor submits proof of payment.
+   *
+   * Accepts either:
+   *   - settle_proof: X402 settle proof string (for AgentPay flow)
+   *   - tx_hash: 0x-prefixed Base chain tx hash (for direct USDC transfer)
+   *
+   * The platform verifies payment, then records the contribution.
    */
-  async execute(contributionId: string, agentId?: string) {
+  async settle(
+    contributionId: string,
+    proof: { settleProof?: string; txHash?: string }
+  ) {
     const contribution = await this.getById(contributionId);
-    if (!contribution) throw new ContributionError("Contribution not found", 404);
-    if (contribution.flowType !== "server") {
-      throw new ContributionError(
-        "This contribution uses client-side flow. Use submitProof instead.",
-        400
-      );
+    if (!contribution)
+      throw new ContributionError("Contribution not found", 404);
+    if (contribution.intentStatus === "BASE_SETTLED") {
+      throw new ContributionError("Contribution already settled", 400);
     }
-    if (contribution.intentStatus !== "AWAITING_PAYMENT") {
+
+    // Look up campaign creator's wallet for tx_hash verification
+    const campaign = await this.campaignService.getById(
+      contribution.campaignId
+    );
+    if (!campaign)
+      throw new ContributionError("Campaign not found", 500);
+
+    const creator = await this.db.query.agents.findFirst({
+      where: eq(schema.agents.id, campaign.agentId),
+    });
+    if (!creator)
+      throw new ContributionError("Campaign creator not found", 500);
+
+    let status: string;
+    let baseTxHash: string | undefined;
+
+    if (proof.settleProof) {
+      // X402 flow — submit proof to AgentPay
+      const result = await this.payment.submitProof(
+        contribution.intentId,
+        proof.settleProof
+      );
+      status = result.status;
+      baseTxHash = result.baseTxHash;
+    } else if (proof.txHash) {
+      // Direct on-chain flow — verify USDC transfer to creator's wallet
+      const isIntentId = !proof.txHash.startsWith("0x");
+
+      if (isIntentId) {
+        // It's actually an intent_id — verify via AgentPay
+        const result = await this.payment.verifyIntentSettled(
+          proof.txHash,
+          creator.walletAddress,
+          contribution.amount.toString()
+        );
+        if (!result.verified) {
+          throw new ContributionError(
+            result.details || "Intent verification failed",
+            402
+          );
+        }
+        status = "BASE_SETTLED";
+        baseTxHash = result.txHash;
+      } else {
+        // Raw tx_hash — verify on-chain
+        const verified = await this.verifyTransferTx(
+          proof.txHash,
+          creator.walletAddress,
+          contribution.amount
+        );
+        if (!verified) {
+          throw new ContributionError(
+            `Transaction ${proof.txHash} could not be verified as a valid payment. ` +
+              `Expected: ≥${contribution.amount} USDC transfer to ${creator.walletAddress} on Base.`,
+            402
+          );
+        }
+        status = "BASE_SETTLED";
+        baseTxHash = proof.txHash;
+      }
+    } else {
       throw new ContributionError(
-        `Cannot execute: intent is ${contribution.intentStatus}`,
+        "Either settle_proof or tx_hash is required",
         400
       );
     }
 
-    const result = await this.payment.executeIntent(contribution.intentId);
-
+    // Update contribution record
     await this.db
       .update(schema.contributions)
       .set({
-        intentStatus: result.status,
-        baseTxHash: result.baseTxHash || null,
+        intentStatus: status,
+        baseTxHash: baseTxHash || null,
         settledAt:
-          result.status === "BASE_SETTLED"
-            ? new Date().toISOString()
-            : null,
+          status === "BASE_SETTLED" ? new Date().toISOString() : null,
       })
       .where(eq(schema.contributions.id, contributionId));
 
     // If settled, update campaign raised amount
-    if (result.status === "BASE_SETTLED") {
+    if (status === "BASE_SETTLED") {
       await this.campaignService.recordContribution(
         contribution.campaignId,
         contribution.amount
@@ -131,45 +216,68 @@ export class ContributionService {
   }
 
   /**
-   * Submit a settlement proof (client-side flow).
-   * https://docs.agent.tech/api/intents/#submitproof
+   * Verify a Base chain transaction is a valid USDC transfer.
+   * Checks the tx receipt for a USDC Transfer event to the expected
+   * recipient with value >= expected amount.
    */
-  async submitProof(contributionId: string, settleProof: string) {
-    const contribution = await this.getById(contributionId);
-    if (!contribution) throw new ContributionError("Contribution not found", 404);
-    if (contribution.flowType !== "client") {
+  private async verifyTransferTx(
+    txHash: string,
+    expectedRecipient: string,
+    expectedAmount: number
+  ): Promise<boolean> {
+    try {
+      const res = await fetch(BASE_RPC, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "eth_getTransactionReceipt",
+          params: [txHash],
+        }),
+      });
+
+      const data = (await res.json()) as {
+        result?: {
+          status: string;
+          logs: Array<{
+            address: string;
+            topics: string[];
+            data: string;
+          }>;
+        };
+      };
+
+      if (!data.result || data.result.status !== "0x1") {
+        return false; // tx failed or not found
+      }
+
+      // ERC-20 Transfer event: Transfer(address,address,uint256)
+      const TRANSFER_TOPIC =
+        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+      const recipientPadded =
+        "0x" +
+        expectedRecipient.slice(2).toLowerCase().padStart(64, "0");
+      const amountInWei = BigInt(Math.round(expectedAmount * 1e6)); // USDC 6 decimals
+
+      for (const log of data.result.logs) {
+        if (
+          log.address.toLowerCase() === USDC_BASE.toLowerCase() &&
+          log.topics[0] === TRANSFER_TOPIC &&
+          log.topics[2]?.toLowerCase() === recipientPadded
+        ) {
+          const amount = BigInt(log.data);
+          if (amount >= amountInWei) return true;
+        }
+      }
+
+      return false;
+    } catch {
       throw new ContributionError(
-        "This contribution uses server-side flow. Use execute instead.",
-        400
+        "Failed to verify transaction on Base chain. Please try again.",
+        503
       );
     }
-
-    const result = await this.payment.submitProof(
-      contribution.intentId,
-      settleProof
-    );
-
-    await this.db
-      .update(schema.contributions)
-      .set({
-        intentStatus: result.status,
-        baseTxHash: result.baseTxHash || null,
-        settledAt:
-          result.status === "BASE_SETTLED"
-            ? new Date().toISOString()
-            : null,
-      })
-      .where(eq(schema.contributions.id, contributionId));
-
-    // If settled, update campaign raised amount
-    if (result.status === "BASE_SETTLED") {
-      await this.campaignService.recordContribution(
-        contribution.campaignId,
-        contribution.amount
-      );
-    }
-
-    return this.getById(contributionId);
   }
 
   /** Get contribution by ID */
@@ -192,11 +300,11 @@ export class ContributionService {
   /**
    * Poll and sync intent status from AgentPay.
    * Call this to refresh a contribution's status.
-   * https://docs.agent.tech/api/intents/#getintent
    */
   async syncStatus(contributionId: string) {
     const contribution = await this.getById(contributionId);
-    if (!contribution) throw new ContributionError("Contribution not found", 404);
+    if (!contribution)
+      throw new ContributionError("Contribution not found", 404);
 
     // Don't poll terminal states
     const terminalStates = [
